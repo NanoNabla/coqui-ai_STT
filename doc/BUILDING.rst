@@ -232,9 +232,9 @@ Due to the discontinuation of Bintray JCenter we do not have pre-built Android p
   project.  Please make sure your project is setup to pull from this repository.
   You can then include the library by just adding this line to your
   ``gradle.build``, adjusting ``VERSION`` to  the version you need:
-  
+
   .. code-block::
-  
+
      implementation 'stt.coqui.ai:libstt:VERSION@aar'
 
 Building ``libstt.so`` for Android

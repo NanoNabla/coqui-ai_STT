@@ -12,7 +12,7 @@ def is_remote_path(path):
     Returns True iff the path is one of the remote formats that this
     module supports
     """
-    return path.startswith('gs://') or path.startswith('hdfs://')
+    return path.startswith("gs://") or path.startswith("hdfs://")
 
 
 def path_exists_remote(path):
@@ -32,7 +32,9 @@ def copy_remote(src, dst, overwrite=False):
     return gfile.copy(src, dst, overwrite)
 
 
-def open_remote(path, mode='r', buffering=-1, encoding=None, newline=None, closefd=True, opener=None):
+def open_remote(
+    path, mode="r", buffering=-1, encoding=None, newline=None, closefd=True, opener=None
+):
     """
     Wrapper around open() method that can handle remote paths like `gs://...`
     off Google Cloud using Tensorflow's IO helpers.
@@ -45,7 +47,15 @@ def open_remote(path, mode='r', buffering=-1, encoding=None, newline=None, close
     """
     if is_remote_path(path):
         return gfile.GFile(path, mode=mode)
-    return open(path, mode, buffering=buffering, encoding=encoding, newline=newline, closefd=closefd, opener=opener)
+    return open(
+        path,
+        mode,
+        buffering=buffering,
+        encoding=encoding,
+        newline=newline,
+        closefd=closefd,
+        opener=opener,
+    )
 
 
 def isdir_remote(path):

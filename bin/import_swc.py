@@ -173,7 +173,6 @@ def in_alphabet(alphabet, c):
     return alphabet.CanEncode(c) if alphabet else True
 
 
-
 ALPHABETS = {}
 
 
@@ -202,8 +201,16 @@ def label_filter(label, language):
     dont_normalize = DONT_NORMALIZE[language] if language in DONT_NORMALIZE else ""
     alphabet = get_alphabet(language)
     for c in label:
-        if CLI_ARGS.normalize and c not in dont_normalize and not in_alphabet(alphabet, c):
-            c = unicodedata.normalize("NFKD", c).encode("ascii", "ignore").decode("ascii", "ignore")
+        if (
+            CLI_ARGS.normalize
+            and c not in dont_normalize
+            and not in_alphabet(alphabet, c)
+        ):
+            c = (
+                unicodedata.normalize("NFKD", c)
+                .encode("ascii", "ignore")
+                .decode("ascii", "ignore")
+            )
         for sc in c:
             if not in_alphabet(alphabet, sc):
                 return None, "illegal character"

@@ -55,7 +55,11 @@ def check_and_prepare_sentence(sentence):
     chars = []
     for c in sentence:
         if CLI_ARGS.normalize and c not in "äöüß" and not in_alphabet(c):
-            c = unicodedata.normalize("NFKD", c).encode("ascii", "ignore").decode("ascii", "ignore")
+            c = (
+                unicodedata.normalize("NFKD", c)
+                .encode("ascii", "ignore")
+                .decode("ascii", "ignore")
+            )
         for sc in c:
             if not in_alphabet(c):
                 return None
@@ -118,7 +122,7 @@ def write_csvs(extracted):
                 sentence = list(meta.iter("cleaned_sentence"))[0].text
                 sentence = check_and_prepare_sentence(sentence)
                 if sentence is None:
-                    reasons['alphabet filter'] += 1
+                    reasons["alphabet filter"] += 1
                     continue
                 for wav_name in wav_names:
                     sample_counter += 1
