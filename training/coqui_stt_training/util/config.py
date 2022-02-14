@@ -107,12 +107,32 @@ class BaseSttConfig(Coqpit):
         # CPU device
         self.cpu_device = "/cpu:0"
 
-        # Available GPU devices
-        self.available_devices = get_available_gpus(self.session_config)
+        if self.horovod:
+            try:
+                import horovod.tensorflow as hvd
+            except ImportError as e:
+                print(
+                    "Error importing Horovod. Did you installed DeepSpeech with 'DS_WITH_HOROVOD=y'? "
+                    "If you do not want to use horovod, do not start with '--horovod=True'"
+                )
+                raise e
+            hvd.init()
+            # Pin GPU to be used to process local rank (one GPU per process)
+            self.session_config.gpu_options.visible_device_list = str(hvd.local_rank())
+            self.num_devices = hvd.size()
+            self.is_master_process = True if hvd.rank() == 0 else False
+        else:
+            # Available GPU devices
+            self.available_devices = get_available_gpus(self.session_config)
 
-        # If there is no GPU available, we fall back to CPU based operation
-        if not self.available_devices:
-            self.available_devices = [self.cpu_device]
+            # If there is no GPU available, we fall back to CPU based operation
+            if not self.available_devices:
+                self.available_devices = [self.cpu_device]
+
+            self.num_devices = len(self.available_devices)
+
+            # If there are no horovod processes the only one should handled like horovod master
+            c.is_master_process = True
 
         # If neither `--alphabet_config_path` nor `--bytes_output_mode` were specified,
         # look for alphabet file alongside loaded checkpoint.
@@ -539,6 +559,11 @@ class BaseSttConfig(Coqpit):
         metadata=dict(
             help="whether to allow automatic mixed precision training. USE OF THIS FLAG IS UNSUPPORTED. Checkpoints created with automatic mixed precision training will not be usable without mixed precision."
         ),
+    )
+
+    horovod: bool = field(
+        default=False,
+        metadata=dict(help="use Horovod for training on multiple machines"),
     )
 
     # Sample limits

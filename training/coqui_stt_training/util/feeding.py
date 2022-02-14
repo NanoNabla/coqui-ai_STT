@@ -149,6 +149,7 @@ def create_dataset(
     process_ahead=None,
     buffering=1 * MEGABYTE,
     epoch_ph=None,
+    split_dataset=False,
 ):
     epoch_counter = Counter()  # survives restarts of the dataset and its generator
 
@@ -219,7 +220,12 @@ def create_dataset(
             (tf.int64, tf.int32, tf.int64),
             tf.float64,
         ),
-    ).map(process_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    )
+    if split_dataset:
+        import horovod.tensorflow as hvd
+
+        dataset = dataset.shard(hvd.size(), hvd.rank())
+    dataset = dataset.map(process_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
     if cache_path:
         dataset = dataset.cache(cache_path)
     dataset = dataset.window(batch_size, drop_remainder=train_phase).flat_map(batch_fn)

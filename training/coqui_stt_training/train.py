@@ -21,6 +21,16 @@ import tensorflow.compat.v1 as tfv1
 import tensorflow as tf
 from coqui_stt_ctcdecoder import Scorer
 
+if Config.horovod:
+    try:
+        import horovod.tensorflow as hvd
+    except ImportError as e:
+        print(
+            "Error importing Horovod. Did you installed DeepSpeech with 'DS_WITH_HOROVOD=y'? "
+            "If you do not want to use horovod, do not start with '--horovod=True'"
+        )
+        raise e
+
 tfv1.logging.set_verbosity(
     {
         "0": tfv1.logging.DEBUG,
@@ -274,19 +284,36 @@ def create_training_datasets(
     and metrics tracking.
     """
     # Create training and validation datasets
-    train_set = create_dataset(
-        Config.train_files,
-        batch_size=Config.train_batch_size,
-        epochs=Config.epochs,
-        augmentations=Config.augmentations,
-        cache_path=Config.feature_cache,
-        train_phase=True,
-        process_ahead=len(Config.available_devices) * Config.train_batch_size * 2,
-        reverse=reverse,
-        limit=limit,
-        buffering=Config.read_buffer,
-        epoch_ph=epoch_ph,
-    )
+    if Config.horovod:
+        train_set = create_dataset(
+            Config.train_files,
+            batch_size=Config.train_batch_size,
+            epochs=Config.epochs,
+            augmentations=Config.augmentations,
+            cache_path=Config.feature_cache,
+            train_phase=True,
+            process_ahead=len(Config.available_devices) * Config.train_batch_size * 2,
+            reverse=reverse,
+            limit=limit,
+            buffering=Config.read_buffer,
+            epoch_ph=epoch_ph,
+            split_dataset=True,
+        )
+    else:
+        train_set = create_dataset(
+            Config.train_files,
+            batch_size=Config.train_batch_size,
+            epochs=Config.epochs,
+            augmentations=Config.augmentations,
+            cache_path=Config.feature_cache,
+            train_phase=True,
+            process_ahead=len(Config.available_devices) * Config.train_batch_size * 2,
+            reverse=reverse,
+            limit=limit,
+            buffering=Config.read_buffer,
+            epoch_ph=epoch_ph,
+            split_dataset=False,
+        )
 
     dev_sets = []
     if Config.dev_files:
@@ -380,7 +407,11 @@ def train_impl(epochs=0, reverse=False, limit=0, write=True, silent_load=False):
     reduce_learning_rate_op = learning_rate_var.assign(
         tf.multiply(learning_rate_var, Config.plateau_reduction)
     )
-    optimizer = create_optimizer(learning_rate_var)
+    if Config.horovod:
+        optimizer = create_optimizer(learning_rate_var)
+        optimizer = hvd.DistributedOptimizer(optimizer)
+    else:
+        optimizer = create_optimizer(learning_rate_var)
 
     # Enable mixed precision training
     if Config.automatic_mixed_precision:
@@ -389,18 +420,35 @@ def train_impl(epochs=0, reverse=False, limit=0, write=True, silent_load=False):
             optimizer
         )
 
-    gradients, loss, non_finite_files = get_tower_results(
-        iterator, optimizer, dropout_rates
-    )
+    if Config.horovod:
+        loss, non_finite_files = calculate_mean_edit_distance_and_loss(
+            iterator, dropout_rates, reuse=False
+        )
+        gradients = optimizer.compute_gradients(loss)
 
-    # Average tower gradients across GPUs
-    avg_tower_gradients = average_gradients(gradients)
+        tfv1.summary.scalar(
+            name="step_loss", tensor=loss, collections=["step_summaries"]
+        )
+        log_grads_and_vars(gradients)
 
-    # global_step is automagically incremented by the optimizer
-    global_step = tfv1.train.get_or_create_global_step()
-    apply_gradient_op = optimizer.apply_gradients(
-        avg_tower_gradients, global_step=global_step
-    )
+        # global_step is automagically incremented by the optimizer
+        global_step = tfv1.train.get_or_create_global_step()
+        apply_gradient_op = optimizer.apply_gradients(
+            gradients, global_step=global_step
+        )
+    else:
+        gradients, loss, non_finite_files = get_tower_results(
+            iterator, optimizer, dropout_rates
+        )
+
+        # Average tower gradients across GPUs
+        avg_tower_gradients = average_gradients(gradients)
+
+        # global_step is automagically incremented by the optimizer
+        global_step = tfv1.train.get_or_create_global_step()
+        apply_gradient_op = optimizer.apply_gradients(
+            avg_tower_gradients, global_step=global_step
+        )
 
     # Summaries
     step_summaries_op = (
@@ -418,7 +466,7 @@ def train_impl(epochs=0, reverse=False, limit=0, write=True, silent_load=False):
                 os.path.join(Config.summary_dir, "metrics"), max_queue=120
             ),
         }
-        if write
+        if write and Config.is_master_process
         else None
     )
 
@@ -428,15 +476,24 @@ def train_impl(epochs=0, reverse=False, limit=0, write=True, silent_load=False):
         "metrics": "Metrics",
     }
 
-    # Checkpointing
-    checkpoint_saver = (
-        tfv1.train.Saver(max_to_keep=Config.max_to_keep) if write else None
-    )
-    checkpoint_path = os.path.join(Config.save_checkpoint_dir, "train")
+    if Config.is_master_process:
+        # Checkpointing
+        checkpoint_saver = (
+            tfv1.train.Saver(max_to_keep=Config.max_to_keep)
+            if write and Config.is_master_process
+            else None
+        )
+        checkpoint_path = os.path.join(Config.save_checkpoint_dir, "train")
 
-    best_dev_saver = tfv1.train.Saver(max_to_keep=1) if write else None
-    best_dev_path = os.path.join(Config.save_checkpoint_dir, "best_dev")
+        best_dev_saver = (
+            tfv1.train.Saver(max_to_keep=1)
+            if write and Config.is_master_process
+            else None
+        )
+        best_dev_path = os.path.join(Config.save_checkpoint_dir, "best_dev")
 
+    if Config.horovod:
+        bcast = hvd.broadcast_global_variables(0)
     with tfv1.Session(config=Config.session_config) as session:
         log_debug("Session opened.")
 
@@ -445,6 +502,9 @@ def train_impl(epochs=0, reverse=False, limit=0, write=True, silent_load=False):
 
         # Load checkpoint or initialize variables
         load_or_init_graph_for_training(session, silent=silent_load)
+
+        if Config.horovod:
+            bcast.run()
 
         def run_set(set_name, epoch, init_op, dataset=None):
             is_train = set_name == "train"
@@ -458,6 +518,7 @@ def train_impl(epochs=0, reverse=False, limit=0, write=True, silent_load=False):
 
             if (
                 write
+                and Config.is_master_process
                 and is_train
                 and Config.cache_for_epochs > 0
                 and Config.feature_cache
@@ -484,21 +545,22 @@ def train_impl(epochs=0, reverse=False, limit=0, write=True, silent_load=False):
                         self, progress, data, **kwargs
                     )
 
-            prefix = "Epoch {} | {:>10}".format(
-                epoch, human_readable_set_names[set_name]
-            )
-            widgets = [
-                " | ",
-                progressbar.widgets.Timer(),
-                " | Steps: ",
-                progressbar.widgets.Counter(),
-                " | ",
-                LossWidget(),
-            ]
-            suffix = " | Dataset: {}".format(dataset) if dataset else None
-            pbar = create_progressbar(
-                prefix=prefix, widgets=widgets, suffix=suffix
-            ).start()
+            if Config.is_master_process:
+                prefix = "Epoch {} | {:>10}".format(
+                    epoch, human_readable_set_names[set_name]
+                )
+                widgets = [
+                    " | ",
+                    progressbar.widgets.Timer(),
+                    " | Steps: ",
+                    progressbar.widgets.Counter(),
+                    " | ",
+                    LossWidget(),
+                ]
+                suffix = " | Dataset: {}".format(dataset) if dataset else None
+                pbar = create_progressbar(
+                    prefix=prefix, widgets=widgets, suffix=suffix
+                ).start()
 
             # Initialize iterator to the appropriate dataset
             session.run(init_op, {epoch_ph: epoch})
@@ -535,15 +597,17 @@ def train_impl(epochs=0, reverse=False, limit=0, write=True, silent_load=False):
                 total_loss += batch_loss
                 step_count += 1
 
-                pbar.update(step_count)
+                if Config.is_master_process:
+                    pbar.update(step_count)
 
-                if write:
+                if write and Config.is_master_process:
                     step_summary_writers.get(set_name).add_summary(
                         step_summary, current_step
                     )
 
                 if (
                     write
+                    and Config.is_master_process
                     and is_train
                     and Config.checkpoint_secs > 0
                     and time.time() - checkpoint_time > Config.checkpoint_secs
@@ -553,11 +617,13 @@ def train_impl(epochs=0, reverse=False, limit=0, write=True, silent_load=False):
                     )
                     checkpoint_time = time.time()
 
-            pbar.finish()
+            if Config.is_master_process:
+                pbar.finish()
             mean_loss = total_loss / step_count if step_count > 0 else 0.0
             return mean_loss, step_count
 
-        log_info("STARTING Optimization")
+        if Config.is_master_process:
+            log_info("STARTING Optimization")
         train_start_time = datetime.utcnow()
         best_dev_loss = float("inf")
         dev_losses = []
@@ -565,12 +631,14 @@ def train_impl(epochs=0, reverse=False, limit=0, write=True, silent_load=False):
         try:
             for epoch in range(epochs):
                 # Training
-                log_progress("Training epoch %d..." % epoch)
+                if Config.is_master_process:
+                    log_progress("Training epoch %d..." % epoch)
                 train_loss, _ = run_set("train", epoch, train_init_op)
-                log_progress(
-                    "Finished training epoch %d - loss: %f" % (epoch, train_loss)
-                )
-                if write:
+                if Config.is_master_process:
+                    log_progress(
+                        "Finished training epoch %d - loss: %f" % (epoch, train_loss)
+                    )
+                if write and Config.is_master_process:
                     checkpoint_saver.save(
                         session, checkpoint_path, global_step=global_step
                     )
@@ -600,7 +668,7 @@ def train_impl(epochs=0, reverse=False, limit=0, write=True, silent_load=False):
                         epochs_without_improvement = 0
 
                     # Save new best model
-                    if write and dev_loss < best_dev_loss:
+                    if write and Config.is_master_process and dev_loss < best_dev_loss:
                         best_dev_loss = dev_loss
                         save_path = best_dev_saver.save(
                             session,
@@ -646,7 +714,7 @@ def train_impl(epochs=0, reverse=False, limit=0, write=True, silent_load=False):
                         )
 
                         # Overwrite best checkpoint with new learning rate value
-                        if write:
+                        if write and Config.is_master_process:
                             save_path = best_dev_saver.save(
                                 session,
                                 best_dev_path,
